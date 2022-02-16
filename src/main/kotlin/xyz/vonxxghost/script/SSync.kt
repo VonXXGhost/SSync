@@ -3,29 +3,42 @@ package xyz.vonxxghost.script
 import kotlinx.cli.ArgParser
 import kotlinx.cli.ArgType
 import kotlinx.cli.default
-import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
-import mu.KotlinLogging
+import kotlinx.coroutines.*
 import xyz.vonxxghost.script.util.FileUtils.crc
 import java.io.File
 import java.io.FileInputStream
+import java.text.SimpleDateFormat
 import java.util.*
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.io.path.Path
+import kotlin.io.path.name
+import kotlin.io.path.pathString
 import kotlin.io.path.relativeTo
 
 /**
  * Created by Vonn.Li on 2022/2/10 10:36
  */
 
-val log = KotlinLogging.logger {}
+object log {
+
+    private val sdf = SimpleDateFormat("HH:mm:ss.SSS")
+
+    fun info(function: () -> String) {
+        info(function.invoke())
+    }
+
+    fun info(message: String) {
+        println( "${nowTime()}: $message")
+    }
+
+    private fun nowTime(): String = sdf.format(Calendar.getInstance().time)
+}
 
 // 文件检查模式
 enum class CheckModel {
-    // 名字
-    NAME,
-
-    // 名字+最后修改时间
-    LAST_MOD_TIME,
+    // 名字+最后修改时间+大小
+    SIMPLE,
 
     // checksum检查
     CHECKSUM
@@ -39,7 +52,7 @@ class Options(args: Array<String>) {
             private set
 
         // 检查模式
-        var checkModel = CheckModel.NAME
+        var checkModel = CheckModel.SIMPLE
             private set
 
         // 源路径
@@ -58,9 +71,13 @@ class Options(args: Array<String>) {
         var include = ""
             private set
 
+        val includeRegex by lazy { Regex(include) }
+
         // 排除正则（优先级高于白名单）
         var exclude = ""
             private set
+
+        val excludeRegex by lazy { Regex(exclude) }
 
         // 递归子文件夹
         var recursive = false
@@ -75,8 +92,7 @@ class Options(args: Array<String>) {
     init {
         val parser = ArgParser("Options")
         val configFile by parser.option(ArgType.String, shortName = "c", description = "配置文件").default(configFile)
-        val checkModel by
-        parser.option(ArgType.Choice<CheckModel>(), shortName = "cm", description = "检查模式")
+        val checkModel by parser.option(ArgType.Choice<CheckModel>(), shortName = "cm", description = "检查模式")
         val srcPath by parser.option(ArgType.String, shortName = "s", description = "源路径")
         val destPath by parser.option(ArgType.String, shortName = "d", description = "目标路径")
         val preview by parser.option(ArgType.Boolean, shortName = "p", description = "仅预览检查结果")
@@ -123,7 +139,7 @@ class Options(args: Array<String>) {
 /**
  * 文件信息
  *
- * @property name 文件名
+ * @property name 文件名（或目录名）
  * @property dir 父级相对路径（不包括本文件名）
  * @property absoluteDir 父级绝对路径（不包括本文件名）
  */
@@ -139,54 +155,60 @@ data class FileInfo(
     val lastModTime: Long
         get() = file.lastModified()
 
+    val size: Long
+        get() = file.length()
+
     val checksum: Long by lazy {
         file.crc()
     }
+
+    val isFile: Boolean
+        get() = file.isFile
+
+    val relativePath: String
+        get() = Path(dir).resolve(name).pathString
 }
 
 /**
  * 文件夹信息
  *
- * @property absolutePath 绝对路径
- * @property dirs 子文件夹
+ * @property root 顶层目录
+ * @property absoluteDir 绝对路径
+ * @property subDirs 子文件夹
  * @property files 直接子文件
  */
 data class DirectoryInfo(
-    val absolutePath: String,
-    val dirs: MutableList<DirectoryInfo> = mutableListOf(),
+    val root: String,
+    val absoluteDir: String,
+    val subDirs: MutableList<DirectoryInfo> = mutableListOf(),
     val files: MutableList<FileInfo> = mutableListOf()
 ) {
-    val totalFileCount: Int
-        get() = calcDirsCount(this)
 
-    private fun calcDirsCount(dir: DirectoryInfo): Int {
-        var count = dir.files.size
-        dirs.forEach {
-            count += calcDirsCount(it)
+    companion object {
+        fun calcRelativePath(path: String, root: String): String {
+            val thisPath = File(path).toPath()
+            val rootPath = File(root).toPath()
+            return thisPath.relativeTo(rootPath).toString()
         }
-        return count
     }
 
-    fun isEmpty(): Boolean = dirs.isEmpty() && files.isEmpty()
+    val name: String by lazy { Path(absoluteDir).name }
 
-    /**
-     * 相对于 root 的相对路径
-     *
-     * @param root 应为this的父路径
-     * @return
-     */
-    fun relativePath(root: String): String {
-        val thisPath = File(absolutePath).toPath()
-        val rootPath = File(root).toPath()
-        val relativePath = thisPath.relativeTo(rootPath)
-        return relativePath.toString()
+    val relativePath: String by lazy {
+        calcRelativePath(absoluteDir, root)
     }
+
+    fun toFileInfo(): FileInfo = FileInfo(
+        name,
+        calcRelativePath(Path(absoluteDir).parent.pathString, root),
+        Path(absoluteDir).parent.pathString
+    )
 }
 
 enum class FileAction {
     ADD,
     DEL,
-    OVERRIDE
+    UPDATE
 }
 
 data class SSyncDecisionResultItem(
@@ -197,27 +219,263 @@ data class SSyncDecisionResultItem(
 )
 
 data class SSyncDecisionResult(
-    val items: Map<String, List<SSyncDecisionResultItem>>
-)
+    val addItems: MutableMap<String, List<SSyncDecisionResultItem>> = ConcurrentHashMap(),
+    val delItems: MutableMap<String, List<SSyncDecisionResultItem>> = ConcurrentHashMap(),
+    val updateItems: MutableMap<String, List<SSyncDecisionResultItem>> = ConcurrentHashMap(),
+) {
+    fun totalCount(): Int {
+        var cnt = 0
+        addItems.values.forEach { cnt += it.size }
+        delItems.values.forEach { cnt += it.size }
+        updateItems.values.forEach { cnt += it.size }
+        return cnt
+    }
+
+    fun summary(): String {
+        val summary = StringBuilder()
+        with(summary) {
+            fun printFunc(): (Map.Entry<String, List<SSyncDecisionResultItem>>) -> Unit = { (_, items) ->
+                run {
+                    items.forEach {
+                        append("\t")
+//                        append(if (it.destFileInfo.isDir) "D:" else "F:")
+                        appendLine(it.destFileInfo.relativePath)
+                    }
+                }
+            }
+
+            appendLine("——分析结果——")
+            appendLine("·新增:")
+            addItems.forEach(printFunc())
+
+            appendLine("·删除:")
+            delItems.forEach(printFunc())
+
+            appendLine("·更新:")
+            updateItems.forEach(printFunc())
+        }
+        return summary.toString()
+    }
+
+    fun merge(other: SSyncDecisionResult) {
+        addItems.putAll(other.addItems)
+        delItems.putAll(other.delItems)
+        updateItems.putAll(other.updateItems)
+    }
+}
 
 class SSyncDecisionTask(
     val srcDictInfo: DirectoryInfo,
     val destDictInfo: DirectoryInfo
 ) {
 
+    private val decisionResult = SSyncDecisionResult()
+
+    private val srcFileNames by lazy {
+        srcDictInfo.files.associateBy { it.name }
+    }
+
+    private val destFileNames by lazy {
+        destDictInfo.files.associateBy { it.name }
+    }
+
+    private val srcDictNames by lazy {
+        srcDictInfo.subDirs.associateBy { Path(it.absoluteDir).name }
+    }
+
+    private val destDictNames by lazy {
+        destDictInfo.subDirs.associateBy { Path(it.absoluteDir).name }
+    }
+
     fun makeDecision(): SSyncDecisionResult {
         runBlocking {
-            var addItem: List<SSyncDecisionResultItem>
-            var delItem: List<SSyncDecisionResultItem>
-            var overrideItem: List<SSyncDecisionResultItem>
             launch {
-                delItem = findDel()
+                decisionResult.addItems[srcDictInfo.relativePath] = findAdd()
+            }
+            launch {
+                decisionResult.delItems[srcDictInfo.relativePath] = findDel()
+            }
+            launch {
+                decisionResult.updateItems[srcDictInfo.relativePath] = findUpdate()
+            }
+            for ((subSrc, subDest) in findBothSubDirs()) {
+                launch {
+                    val subResult = SSyncDecisionTask(subSrc, subDest).makeDecision()
+                    decisionResult.merge(subResult)
+                }
+            }
+        }
+        return decisionResult
+    }
+
+    private fun findBothSubDirs(): List<Pair<DirectoryInfo, DirectoryInfo>> {
+        return srcDictInfo.subDirs
+            .filter { it.name in destDictNames.keys }
+            .map { Pair(it, destDictNames[it.name]!!) }
+            .toList()
+    }
+
+    /**
+     * 只根据文件名/目录名判断，源目录下有，新目录下没有，就新增
+     *
+     * @return
+     */
+    private fun findAdd(): List<SSyncDecisionResultItem> {
+        val addItems = mutableListOf<SSyncDecisionResultItem>()
+        // 判断目录
+        if (Options.recursive) {
+            srcDictInfo.subDirs.forEach {
+                if (it.name !in destDictNames.keys) {
+                    addItems.add(
+                        SSyncDecisionResultItem(
+                            FileAction.ADD,
+                            it.toFileInfo(),
+                            geneAddDestFileInfo(it.toFileInfo())
+                        )
+                    )
+                }
+            }
+        }
+        // 判断文件
+        srcDictInfo.files.forEach {
+            if (it.name !in destFileNames.keys) {
+                addItems.add(SSyncDecisionResultItem(FileAction.ADD, it, geneAddDestFileInfo(it)))
+            }
+        }
+        return addItems
+    }
+
+    private fun geneAddDestFileInfo(src: FileInfo): FileInfo {
+        // 关键在于根据相对目录生成目标的绝对目录
+        val absolutePath = Path(destDictInfo.root).resolve(src.dir).toAbsolutePath().pathString
+        return FileInfo(src.name, src.dir, absolutePath)
+    }
+
+    /**
+     * 只根据文件名/目录名判断，源目录下没有，新目录下有，就删除
+     *
+     * @return
+     */
+    private fun findDel(): List<SSyncDecisionResultItem> {
+        val delItems = mutableListOf<SSyncDecisionResultItem>()
+        // 判断目录
+        if (Options.recursive) {
+            destDictInfo.subDirs.forEach {
+                if (it.name !in srcDictNames.keys) {
+                    delItems.add(SSyncDecisionResultItem(FileAction.DEL, null, it.toFileInfo()))
+                }
+            }
+        }
+        // 判断文件
+        destDictInfo.files.forEach {
+            if (it.name !in srcFileNames.keys) {
+                delItems.add(SSyncDecisionResultItem(FileAction.DEL, null, it))
+            }
+        }
+        return delItems
+    }
+
+    /**
+     * 根据配置判断更新了的文件。
+     * 因为新增、删除在其他任务里了，这里只需要管两边都有的文件即可
+     *
+     * @return
+     */
+    private suspend fun findUpdate(): List<SSyncDecisionResultItem> {
+        val updateItems = mutableListOf<SSyncDecisionResultItem>()
+        destDictInfo.files.forEach {
+            if (it.name !in srcFileNames.keys) {
+                return@forEach
+            }
+            val srcFileInfo = srcFileNames[it.name]
+            if (checkHasUpdated(srcFileInfo!!, it)) {
+                updateItems.add(SSyncDecisionResultItem(FileAction.UPDATE, srcFileInfo, it))
+            }
+        }
+        return updateItems
+    }
+
+    /**
+     * 对比两文件是否发生了变更
+     *
+     * @param src
+     * @param dest
+     * @return ture：存在变更
+     */
+    private suspend fun checkHasUpdated(src: FileInfo, dest: FileInfo): Boolean {
+        if (!src.isFile || !dest.isFile) {
+            return false
+        }
+        return when (Options.checkModel) {
+            CheckModel.SIMPLE -> checkHasUpdatedSimple(src, dest)
+            CheckModel.CHECKSUM -> checkHasUpdatedChecksum(src, dest)
+        }
+    }
+
+    private fun checkHasUpdatedSimple(src: FileInfo, dest: FileInfo): Boolean {
+        return src.lastModTime != dest.lastModTime || src.size != dest.size
+    }
+
+    private suspend fun checkHasUpdatedChecksum(src: FileInfo, dest: FileInfo): Boolean {
+        var result: Boolean
+        withContext(Dispatchers.IO) {
+            result = src.checksum != dest.checksum
+        }
+        return result
+    }
+}
+
+
+class SSyncDecisionExecuteTask(val decision: SSyncDecisionResult) {
+
+    private val totalCount = decision.totalCount()
+    private val processedCount = AtomicInteger()
+
+    fun execute() {
+        log.info { "同步任务开始执行" }
+        executeAddTask(decision.addItems)
+        executeUpdateTask(decision.updateItems)
+        executeDelTask(decision.delItems)
+        log.info { "同步任务执行完毕" }
+    }
+
+    private fun logProgress(item: SSyncDecisionResultItem) {
+        when (item.action) {
+            FileAction.ADD -> log.info { "(${processedCount.addAndGet(1)}/$totalCount) Adding - " +
+                    "'${item.srcFileInfo?.absoluteDir}' to '${item.destFileInfo.absoluteDir}'" }
+            FileAction.DEL -> log.info { "(${processedCount.addAndGet(1)}/$totalCount) Deleting - " +
+                    "'${item.destFileInfo.absoluteDir}'" }
+            FileAction.UPDATE -> log.info { "(${processedCount.addAndGet(1)}/$totalCount) Updating - " +
+                    "'${item.srcFileInfo?.absoluteDir}' to '${item.destFileInfo.absoluteDir}'" }
+        }
+    }
+
+    private fun executeAddTask(addItems: Map<String, List<SSyncDecisionResultItem>>) {
+        for ((dir, items) in addItems) {
+            File(dir).mkdirs()
+            items.forEach {
+                logProgress(it)
+                it.srcFileInfo!!.file.copyRecursively(it.destFileInfo.file, overwrite = false)
             }
         }
     }
 
-    private fun findDel(): List<SSyncDecisionResultItem> {
-        TODO("Not yet implemented")
+    private fun executeUpdateTask(updateItems: Map<String, List<SSyncDecisionResultItem>>) {
+        for ((_, items) in updateItems) {
+            items.forEach {
+                logProgress(it)
+                it.srcFileInfo!!.file.copyRecursively(it.destFileInfo.file, overwrite = true)
+            }
+        }
+    }
+
+    private fun executeDelTask(delItems: Map<String, List<SSyncDecisionResultItem>>) {
+        for ((_, items) in delItems) {
+            items.forEach {
+                logProgress(it)
+                it.destFileInfo.file.deleteOnExit()
+            }
+        }
     }
 }
 
@@ -225,14 +483,14 @@ class SSyncDecisionTask(
 /**
  * 加载目标目录下所有文件
  *
- * @param dir
+ * @param absolutePath
  * @param recursive 递归加载
  * @param rootDir recursive为true时需要提供
  * @return
  */
-fun loadAllFile(dir: String, recursive: Boolean = false, rootDir: String = ""): DirectoryInfo {
-    val files = File(dir)
-    val directoryInfo = DirectoryInfo(dir)
+fun loadAllFile(absolutePath: String, recursive: Boolean = false, rootDir: String = ""): DirectoryInfo {
+    val files = File(absolutePath)
+    val directoryInfo = DirectoryInfo(rootDir, absolutePath)
     if (!files.exists() || !files.isDirectory) {
         return directoryInfo
     }
@@ -240,21 +498,33 @@ fun loadAllFile(dir: String, recursive: Boolean = false, rootDir: String = ""): 
         throw IllegalArgumentException("rootDir can not be empty when recursive is true")
     }
     files.listFiles { file: File -> file.isFile }
+        ?.filter { checkIncludeAndExclude(it) }
         ?.forEach {
-            val fileInfo = FileInfo(it.name, directoryInfo.relativePath(rootDir), dir)
+            val fileInfo = FileInfo(it.name, directoryInfo.relativePath, absolutePath)
             directoryInfo.files.add(fileInfo)
         }
     files.listFiles { file: File -> file.isDirectory }
+        ?.filter { checkIncludeAndExclude(it) }
         ?.forEach {
             val dictInfo = if (recursive) {
                 loadAllFile(it.absolutePath, true, rootDir)
             } else {
-                DirectoryInfo(it.absolutePath)
+                DirectoryInfo(rootDir, it.absolutePath)
             }
-            directoryInfo.dirs.add(dictInfo)
+            directoryInfo.subDirs.add(dictInfo)
         }
 
     return directoryInfo
+}
+
+fun checkIncludeAndExclude(file: File): Boolean {
+    if (Options.include.isNotBlank() && !Options.includeRegex.matches(file.absolutePath)) {
+        return false
+    }
+    if (Options.exclude.isNotBlank() && Options.excludeRegex.matches(file.absolutePath)) {
+        return false
+    }
+    return true
 }
 
 
@@ -264,16 +534,21 @@ fun main(args: Array<String>) {
     var destDictInfo: DirectoryInfo? = null
     runBlocking {
         launch {
-            log.info { "start loading srcDictInfo" }
             srcDictInfo = loadAllFile(Options.srcPath, Options.recursive, Options.srcPath)
-            log.debug { "srcDictInfo: $srcDictInfo" }
         }
         launch {
-            log.info { "start loading destDictInfo" }
             destDictInfo = loadAllFile(Options.destPath, Options.recursive, Options.destPath)
-            log.debug { "destDictInfo: $destDictInfo" }
         }
     }
-    log.info { "All dictInfo loaded" }
-
+    log.info { "已加载目录信息" }
+    val task = SSyncDecisionTask(srcDictInfo!!, destDictInfo!!)
+    val decisionResult = task.makeDecision()
+    log.info { decisionResult.summary() }
+    if (Options.preview) {
+        return
+    }
+    log.info { "按下回车开始执行任务……" }
+    readLine()
+    SSyncDecisionExecuteTask(decisionResult).execute()
+    readLine()
 }

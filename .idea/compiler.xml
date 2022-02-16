@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="CompilerConfiguration">
+    <bytecodeTargetLevel target="1.8">
+      <module name="jvm" target="1.8" />
+      <module name="jvm.main" target="1.8" />
+      <module name="jvm.test" target="1.8" />
+      <module name="xyz.vonxxghost.script" target="1.8" />
+      <module name="xyz.vonxxghost.script.main" target="1.8" />
+      <module name="xyz.vonxxghost.script.test" target="1.8" />
+    </bytecodeTargetLevel>
+  </component>
+</project>
