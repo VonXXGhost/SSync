@@ -468,7 +468,6 @@ class SSyncDecisionExecuteTask(val decision: SSyncDecisionResult) {
 
     private fun executeAddTask(addItems: Map<String, List<SSyncDecisionResultItem>>) {
         for ((dir, items) in addItems) {
-            File(dir).mkdirs()
             items.forEach {
                 logProgress(it)
                 it.srcFileInfo!!.file.copyRecursively(it.destFileInfo.file, overwrite = false, copyAttributes = true)
