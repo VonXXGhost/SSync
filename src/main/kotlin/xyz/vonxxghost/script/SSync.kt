@@ -5,6 +5,7 @@ import kotlinx.cli.ArgType
 import kotlinx.cli.default
 import kotlinx.coroutines.*
 import xyz.vonxxghost.script.util.FileUtils.crc
+import xyz.vonxxghost.script.util.copyRecursively
 import java.io.File
 import java.io.FileInputStream
 import java.text.SimpleDateFormat
@@ -15,6 +16,7 @@ import kotlin.io.path.Path
 import kotlin.io.path.name
 import kotlin.io.path.pathString
 import kotlin.io.path.relativeTo
+import kotlin.system.exitProcess
 
 /**
  * Created by Vonn.Li on 2022/2/10 10:36
@@ -29,7 +31,7 @@ object log {
     }
 
     fun info(message: String) {
-        println( "${nowTime()}: $message")
+        println("${nowTime()}: $message")
     }
 
     private fun nowTime(): String = sdf.format(Calendar.getInstance().time)
@@ -105,8 +107,8 @@ class Options(args: Array<String>) {
         loadConfigFromFile()
 
         checkModel?.let { Companion.checkModel = it }
-        srcPath?.let { Companion.srcPath = it }
-        destPath?.let { Companion.destPath = it }
+        srcPath?.let { Companion.srcPath = File(it).absolutePath }
+        destPath?.let { Companion.destPath = File(it).absolutePath }
         preview?.let { Companion.preview = it }
         include?.let { Companion.include = it }
         exclude?.let { Companion.exclude = it }
@@ -126,7 +128,10 @@ class Options(args: Array<String>) {
         checkModel = CheckModel.valueOf(checkModelStr.uppercase())
 
         srcPath = prop.getProperty("srcPath") ?: prop.getProperty("s") ?: srcPath
+        srcPath = File(srcPath).absolutePath
         destPath = prop.getProperty("destPath") ?: prop.getProperty("d") ?: destPath
+        destPath = File(destPath).absolutePath
+
         preview = (prop.getProperty("preview") ?: prop.getProperty("p"))
             ?.toBooleanStrictOrNull() ?: preview
         recursive = (prop.getProperty("recursive") ?: prop.getProperty("r"))
@@ -232,6 +237,9 @@ data class SSyncDecisionResult(
     }
 
     fun summary(): String {
+        if (isEmpty()) {
+            return "无任务需执行"
+        }
         val summary = StringBuilder()
         with(summary) {
             fun printFunc(): (Map.Entry<String, List<SSyncDecisionResultItem>>) -> Unit = { (_, items) ->
@@ -262,6 +270,8 @@ data class SSyncDecisionResult(
         delItems.putAll(other.delItems)
         updateItems.putAll(other.updateItems)
     }
+
+    fun isEmpty(): Boolean = totalCount() == 0
 }
 
 class SSyncDecisionTask(
@@ -441,12 +451,18 @@ class SSyncDecisionExecuteTask(val decision: SSyncDecisionResult) {
 
     private fun logProgress(item: SSyncDecisionResultItem) {
         when (item.action) {
-            FileAction.ADD -> log.info { "(${processedCount.addAndGet(1)}/$totalCount) Adding - " +
-                    "'${item.srcFileInfo?.absoluteDir}' to '${item.destFileInfo.absoluteDir}'" }
-            FileAction.DEL -> log.info { "(${processedCount.addAndGet(1)}/$totalCount) Deleting - " +
-                    "'${item.destFileInfo.absoluteDir}'" }
-            FileAction.UPDATE -> log.info { "(${processedCount.addAndGet(1)}/$totalCount) Updating - " +
-                    "'${item.srcFileInfo?.absoluteDir}' to '${item.destFileInfo.absoluteDir}'" }
+            FileAction.ADD -> log.info {
+                "(${processedCount.addAndGet(1)}/$totalCount) Copying - " +
+                        "'${item.srcFileInfo?.file?.absolutePath}' to '${item.destFileInfo.file.absolutePath}'"
+            }
+            FileAction.DEL -> log.info {
+                "(${processedCount.addAndGet(1)}/$totalCount) Deleting - " +
+                        "'${item.destFileInfo.file.absolutePath}'"
+            }
+            FileAction.UPDATE -> log.info {
+                "(${processedCount.addAndGet(1)}/$totalCount) Updating - " +
+                        "'${item.srcFileInfo?.file?.absolutePath}' to '${item.destFileInfo.file.absolutePath}'"
+            }
         }
     }
 
@@ -455,7 +471,7 @@ class SSyncDecisionExecuteTask(val decision: SSyncDecisionResult) {
             File(dir).mkdirs()
             items.forEach {
                 logProgress(it)
-                it.srcFileInfo!!.file.copyRecursively(it.destFileInfo.file, overwrite = false)
+                it.srcFileInfo!!.file.copyRecursively(it.destFileInfo.file, overwrite = false, copyAttributes = true)
             }
         }
     }
@@ -464,7 +480,7 @@ class SSyncDecisionExecuteTask(val decision: SSyncDecisionResult) {
         for ((_, items) in updateItems) {
             items.forEach {
                 logProgress(it)
-                it.srcFileInfo!!.file.copyRecursively(it.destFileInfo.file, overwrite = true)
+                it.srcFileInfo!!.file.copyRecursively(it.destFileInfo.file, overwrite = true, copyAttributes = true)
             }
         }
     }
@@ -473,7 +489,7 @@ class SSyncDecisionExecuteTask(val decision: SSyncDecisionResult) {
         for ((_, items) in delItems) {
             items.forEach {
                 logProgress(it)
-                it.destFileInfo.file.deleteOnExit()
+                it.destFileInfo.file.deleteRecursively()
             }
         }
     }
@@ -527,6 +543,11 @@ fun checkIncludeAndExclude(file: File): Boolean {
     return true
 }
 
+fun readyToExit() {
+    log.info { "按下回车结束程序" }
+    readLine()
+    exitProcess(0)
+}
 
 fun main(args: Array<String>) {
     Options(args)
@@ -545,10 +566,22 @@ fun main(args: Array<String>) {
     val decisionResult = task.makeDecision()
     log.info { decisionResult.summary() }
     if (Options.preview) {
-        return
+        readyToExit()
     }
-    log.info { "按下回车开始执行任务……" }
-    readLine()
+    if (decisionResult.isEmpty()) {
+        readyToExit()
+    }
+    do {
+        log.info { "是否开始执行任务[Y/N]:" }
+        val ans = readLine()?.trim()?.uppercase()
+        if (ans == "Y") {
+            break
+        } else if (ans == "N") {
+            readyToExit()
+        } else {
+            log.info { "预料之外的输入" }
+        }
+    } while (true)
     SSyncDecisionExecuteTask(decisionResult).execute()
-    readLine()
+    readyToExit()
 }
