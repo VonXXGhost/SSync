@@ -1,11 +1,11 @@
-package xyz.vonxxghost.script
+package xyz.vonxxghost.ssync
 
 import kotlinx.cli.ArgParser
 import kotlinx.cli.ArgType
 import kotlinx.cli.default
 import kotlinx.coroutines.*
-import xyz.vonxxghost.script.util.FileUtils.crc
-import xyz.vonxxghost.script.util.copyRecursively
+import xyz.vonxxghost.ssync.util.FileUtils.crc
+import xyz.vonxxghost.ssync.util.copyRecursively
 import java.io.File
 import java.io.FileInputStream
 import java.text.SimpleDateFormat
@@ -467,7 +467,7 @@ class SSyncDecisionExecuteTask(val decision: SSyncDecisionResult) {
     }
 
     private fun executeAddTask(addItems: Map<String, List<SSyncDecisionResultItem>>) {
-        for ((dir, items) in addItems) {
+        for ((_, items) in addItems) {
             items.forEach {
                 logProgress(it)
                 it.srcFileInfo!!.file.copyRecursively(it.destFileInfo.file, overwrite = false, copyAttributes = true)

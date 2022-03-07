@@ -1,4 +1,4 @@
-package xyz.vonxxghost.script.util
+package xyz.vonxxghost.ssync.util
 
 import java.io.File
 import java.io.FileInputStream
