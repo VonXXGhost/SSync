@@ -8,6 +8,8 @@ import xyz.vonxxghost.ssync.util.FileUtils.crc
 import xyz.vonxxghost.ssync.util.copyRecursively
 import java.io.File
 import java.io.FileInputStream
+import java.io.InputStreamReader
+import java.nio.charset.Charset
 import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
@@ -31,7 +33,7 @@ object log {
     }
 
     fun info(message: String) {
-        println("${nowTime()}: $message")
+        println(message)
     }
 
     private fun nowTime(): String = sdf.format(Calendar.getInstance().time)
@@ -93,14 +95,15 @@ class Options(args: Array<String>) {
 
     init {
         val parser = ArgParser("Options")
-        val configFile by parser.option(ArgType.String, shortName = "c", description = "配置文件").default(configFile)
+        val configFile by parser.option(ArgType.String, shortName = "c", description = "配置文件，文件编码应为UTF-8")
+            .default(configFile)
         val checkModel by parser.option(ArgType.Choice<CheckModel>(), shortName = "cm", description = "检查模式")
         val srcPath by parser.option(ArgType.String, shortName = "s", description = "源路径")
         val destPath by parser.option(ArgType.String, shortName = "d", description = "目标路径")
-        val preview by parser.option(ArgType.Boolean, shortName = "p", description = "仅预览检查结果")
-        val include by parser.option(ArgType.String, shortName = "in", description = "白名单正则")
-        val exclude by parser.option(ArgType.String, shortName = "ex", description = "排除正则")
-        val recursive by parser.option(ArgType.Boolean, shortName = "r", description = "递归子文件夹")
+        val preview by parser.option(ArgType.Boolean, shortName = "p", description = "是否仅预览检查结果")
+        val include by parser.option(ArgType.String, shortName = "in", description = "白名单绝对路径正则")
+        val exclude by parser.option(ArgType.String, shortName = "ex", description = "排除绝对路径正则")
+        val recursive by parser.option(ArgType.Boolean, shortName = "r", description = "是否递归子文件夹")
         parser.parse(args)
 
         Companion.configFile = configFile
@@ -122,7 +125,8 @@ class Options(args: Array<String>) {
             return
         }
         val prop = Properties()
-        prop.load(FileInputStream(configFile))
+        val fileInputStream = FileInputStream(configFile)
+        prop.load(InputStreamReader(fileInputStream, Charset.forName("UTF-8")))
 
         val checkModelStr = prop.getProperty("checkModel") ?: prop.getProperty("cm") ?: checkModel.name
         checkModel = CheckModel.valueOf(checkModelStr.uppercase())
